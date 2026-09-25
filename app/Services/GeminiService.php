@@ -2,12 +2,15 @@
 
 namespace App\Services;
 
+use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\Http;
 use RuntimeException;
 
 class GeminiService
 {
     private const BASE = 'https://generativelanguage.googleapis.com/v1beta';
+
+    private const RETRY_TIMES = 4;
 
     private string $key;
 
@@ -27,13 +30,14 @@ class GeminiService
 
     public function embed(string $text): array
     {
-        $response = Http::post(self::BASE."/models/{$this->embedModel}:embedContent?key={$this->key}", [
-            'content' => ['parts' => [['text' => $text]]],
-            'outputDimensionality' => $this->embedDimension,
-        ]);
-
-        if ($response->failed()) {
-            throw new RuntimeException('Gemini embed failed: '.$response->body());
+        try {
+            $response = Http::retry(self::RETRY_TIMES, $this->backoff(...), $this->retryOn503(...))
+                ->post(self::BASE."/models/{$this->embedModel}:embedContent?key={$this->key}", [
+                    'content' => ['parts' => [['text' => $text]]],
+                    'outputDimensionality' => $this->embedDimension,
+                ]);
+        } catch (RequestException $e) {
+            throw new RuntimeException('Gemini embed failed: '.$e->response->body(), previous: $e);
         }
 
         return $response->json('embedding.values') ?? [];
@@ -51,12 +55,13 @@ class GeminiService
             'outputDimensionality' => $this->embedDimension,
         ], $texts);
 
-        $response = Http::post(self::BASE."/models/{$this->embedModel}:batchEmbedContents?key={$this->key}", [
-            'requests' => $requests,
-        ]);
-
-        if ($response->failed()) {
-            throw new RuntimeException('Gemini batch embed failed: '.$response->body());
+        try {
+            $response = Http::retry(self::RETRY_TIMES, $this->backoff(...), $this->retryOn503(...))
+                ->post(self::BASE."/models/{$this->embedModel}:batchEmbedContents?key={$this->key}", [
+                    'requests' => $requests,
+                ]);
+        } catch (RequestException $e) {
+            throw new RuntimeException('Gemini batch embed failed: '.$e->response->body(), previous: $e);
         }
 
         return array_map(
@@ -74,15 +79,16 @@ class GeminiService
         $full = '';
         $buffer = '';
 
-        $response = Http::withOptions(['stream' => true])
-            ->post(self::BASE."/models/{$this->chatModel}:streamGenerateContent?alt=sse&key={$this->key}", [
-                'systemInstruction' => ['parts' => [['text' => $systemInstruction]]],
-                'contents' => [['role' => 'user', 'parts' => [['text' => $userPrompt]]]],
-                'generationConfig' => ['temperature' => 0.2],
-            ]);
-
-        if ($response->failed()) {
-            throw new RuntimeException('Gemini stream generate failed: '.$response->body());
+        try {
+            $response = Http::withOptions(['stream' => true])
+                ->retry(self::RETRY_TIMES, $this->backoff(...), $this->retryOn503(...))
+                ->post(self::BASE."/models/{$this->chatModel}:streamGenerateContent?alt=sse&key={$this->key}", [
+                    'systemInstruction' => ['parts' => [['text' => $systemInstruction]]],
+                    'contents' => [['role' => 'user', 'parts' => [['text' => $userPrompt]]]],
+                    'generationConfig' => ['temperature' => 0.2],
+                ]);
+        } catch (RequestException $e) {
+            throw new RuntimeException('Gemini stream generate failed: '.$e->response->body(), previous: $e);
         }
 
         $body = $response->toPsrResponse()->getBody();
@@ -127,5 +133,24 @@ class GeminiService
         $consumeEvents();
 
         return $full;
+    }
+
+    /**
+     * Only retry on 503 (Gemini "high demand" / UNAVAILABLE) responses.
+     * Laravel's retry `when` callback can also receive a ConnectionException, so this
+     * must not narrow-type to RequestException or non-503 failures crash with a TypeError.
+     */
+    private function retryOn503(\Throwable $exception): bool
+    {
+        return $exception instanceof RequestException
+            && $exception->response->status() === 503;
+    }
+
+    /**
+     * Exponential backoff in milliseconds: 1000, 2000, 4000, capped at 8000.
+     */
+    private function backoff(int $attempt): int
+    {
+        return min(1000 * 2 ** ($attempt - 1), 8000);
     }
 }
