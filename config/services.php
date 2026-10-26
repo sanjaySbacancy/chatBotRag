@@ -49,4 +49,11 @@ return [
         'dimension' => 768,
     ],
 
+    'answer' => [
+        // Verified mode: strict-JSON model output, every claim checked in code. Set false for the legacy free-text answer.
+        'verified' => env('ANSWER_VERIFIED_MODE', true),
+        'top_k' => (int) env('RETRIEVAL_TOP_K', 5),
+        'max_evidence' => (int) env('MAX_EVIDENCE', 12),
+    ],
+
 ];

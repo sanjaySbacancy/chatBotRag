@@ -1,5 +1,6 @@
 import ProcessSteps from './ProcessSteps.jsx';
 import SourcesAccordion from './SourcesAccordion.jsx';
+import FeedbackButtons from './FeedbackButtons.jsx';
 
 export default function MessageBubble({ message }) {
     const isUser = message.role === 'user';
@@ -26,7 +27,19 @@ export default function MessageBubble({ message }) {
                     </p>
                 )}
 
+                {!isUser && !message.streaming && message.warnings?.length > 0 && (
+                    <ul className="mt-2 space-y-1 rounded-lg bg-amber-50 p-2 text-xs text-amber-800">
+                        {message.warnings.map((w, i) => (
+                            <li key={i}>{w}</li>
+                        ))}
+                    </ul>
+                )}
+
                 {!isUser && !message.streaming && <SourcesAccordion sources={message.sources} />}
+
+                {!isUser && !message.streaming && message.status !== 'chitchat' && (
+                    <FeedbackButtons messageId={message.messageId} />
+                )}
             </div>
         </div>
     );

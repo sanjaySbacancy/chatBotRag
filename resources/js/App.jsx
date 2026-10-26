@@ -50,7 +50,16 @@ export default function App() {
             onDone: (payload) => {
                 setMessages((prev) =>
                     prev.map((m) =>
-                        m.id === assistantId ? { ...m, sources: payload.sources ?? [], streaming: false } : m
+                        m.id === assistantId
+                            ? {
+                                  ...m,
+                                  sources: payload.sources ?? [],
+                                  messageId: payload.message_id ?? null,
+                                  status: payload.status ?? null,
+                                  warnings: payload.warnings ?? [],
+                                  streaming: false,
+                              }
+                            : m
                     )
                 );
             },

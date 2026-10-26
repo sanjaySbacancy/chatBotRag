@@ -74,7 +74,7 @@ class GeminiService
      * Streams a Gemini generation, invoking $onToken for every text delta.
      * Returns the full concatenated response text.
      */
-    public function streamGenerate(string $systemInstruction, string $userPrompt, callable $onToken): string
+    public function streamGenerate(string $systemInstruction, string $userPrompt, callable $onToken, array $generationConfig = []): string
     {
         $full = '';
         $buffer = '';
@@ -85,7 +85,7 @@ class GeminiService
                 ->post(self::BASE."/models/{$this->chatModel}:streamGenerateContent?alt=sse&key={$this->key}", [
                     'systemInstruction' => ['parts' => [['text' => $systemInstruction]]],
                     'contents' => [['role' => 'user', 'parts' => [['text' => $userPrompt]]]],
-                    'generationConfig' => ['temperature' => 0.2],
+                    'generationConfig' => array_merge(['temperature' => 0.2], $generationConfig),
                 ]);
         } catch (RequestException $e) {
             throw new RuntimeException('Gemini stream generate failed: '.$e->response->body(), previous: $e);

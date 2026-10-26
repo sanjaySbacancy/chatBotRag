@@ -4,6 +4,13 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\ChatConversation;
+use App\Models\Chunk;
+use App\Models\Message;
+use App\Services\Answer\AnswerService;
+use App\Services\Answer\EvidencePacket;
+use App\Services\Answer\FollowUpResolver;
+use App\Services\Answer\IntentClassifier;
+use App\Services\Answer\SmallTalk;
 use App\Services\GeminiService;
 use App\Services\PineconeService;
 use Illuminate\Http\Request;
@@ -29,13 +36,19 @@ class ChatController extends Controller
             ? ChatConversation::findOrFail($data['conversation_id'])
             : ChatConversation::create(['title' => Str::limit($data['message'], 50)]);
 
-        $conversation->messages()->create([
+        $userMessage = $conversation->messages()->create([
             'role' => 'user',
             'content' => $data['message'],
         ]);
 
-        return response()->stream(function () use ($gemini, $pinecone, $data, $conversation) {
+        return response()->stream(function () use ($gemini, $pinecone, $data, $conversation, $userMessage) {
             $this->sendEvent('meta', ['conversation_id' => $conversation->id]);
+
+            if (config('services.answer.verified')) {
+                $this->streamVerified($data['message'], $conversation, $userMessage, $gemini, $pinecone);
+
+                return;
+            }
 
             $this->sendStep('understand', 'completed', 'Understanding your question', 'Question: "'.$data['message'].'"');
 
@@ -43,7 +56,7 @@ class ChatController extends Controller
                 $queryVector = $this->runStep(
                     'embed',
                     'Embedding your question',
-                    'Calling Gemini ('.config('services.gemini.embed_model').") to turn your question into a vector for semantic search.",
+                    'Calling Gemini ('.config('services.gemini.embed_model').') to turn your question into a vector for semantic search.',
                     function () use ($gemini, $data) {
                         $vector = $gemini->embed($data['message']);
 
@@ -107,19 +120,219 @@ class ChatController extends Controller
                 return;
             }
 
-            $conversation->messages()->create([
+            $assistant = $conversation->messages()->create([
                 'role' => 'assistant',
                 'content' => $full,
                 'sources' => $sources,
             ]);
 
-            $this->sendEvent('done', ['sources' => $sources]);
+            $this->sendEvent('done', ['sources' => $sources, 'message_id' => $assistant->id]);
         }, 200, [
             'Content-Type' => 'text/event-stream',
             'Cache-Control' => 'no-cache',
             'X-Accel-Buffering' => 'no',
             'Connection' => 'keep-alive',
         ]);
+    }
+
+    /**
+     * Verified pipeline: small talk shortcut, intent + follow-up resolution, retrieval, strict-JSON
+     * generation, code-side validation. Emits the same SSE events as the legacy flow.
+     */
+    private function streamVerified(
+        string $message,
+        ChatConversation $conversation,
+        Message $userMessage,
+        GeminiService $gemini,
+        PineconeService $pinecone,
+    ): void {
+        $smallTalk = app(SmallTalk::class)->reply($message);
+
+        if ($smallTalk !== null) {
+            $this->sendStep('understand', 'completed', 'Understanding your question', 'This is small talk, so no document search or model call is needed.');
+            $this->finishVerified($conversation, [
+                'status' => AnswerService::CHITCHAT,
+                'content' => $smallTalk,
+                'sources' => [],
+                'claims' => [],
+                'conflicts' => [],
+                'calculations' => [],
+                'warnings' => [],
+            ], []);
+
+            return;
+        }
+
+        $intent = app(IntentClassifier::class)->classify($message);
+        $previous = $conversation->messages()
+            ->where('role', 'user')
+            ->where('id', '<', $userMessage->id)
+            ->orderByDesc('id')
+            ->first();
+        $resolved = app(FollowUpResolver::class)->resolve($message, $previous?->content);
+
+        $this->sendStep(
+            'understand',
+            'completed',
+            'Understanding your question',
+            'Question: "'.$message.'"'."\nType: {$intent}".($resolved['follow_up'] ? "\nTreated as a follow-up to your previous question." : '')
+        );
+
+        $trace = ['intent' => $intent, 'query_used' => $resolved['query'], 'follow_up_used' => $resolved['follow_up']];
+
+        try {
+            $queryVector = $this->runStep(
+                'embed',
+                'Embedding your question',
+                'Calling Gemini ('.config('services.gemini.embed_model').') to turn your question into a vector for semantic search.',
+                function () use ($gemini, $resolved) {
+                    $vector = $gemini->embed($resolved['query']);
+
+                    return [$vector, 'Generated a '.count($vector).'-dimension embedding of your question.'];
+                }
+            );
+
+            $topK = app(IntentClassifier::class)->topK($intent, (int) config('services.answer.top_k'));
+
+            $matches = $this->runStep(
+                'search',
+                'Searching your documents',
+                'Querying the Pinecone index ("'.config('services.pinecone.index').'") for the top '.$topK.' most relevant passages.',
+                function () use ($pinecone, $queryVector, $topK) {
+                    $found = $pinecone->query($queryVector, $topK);
+                    $detail = count($found) > 0
+                        ? count($found).' matching passage(s) found across your uploaded documents.'
+                        : 'No matching passages found in your uploaded documents.';
+
+                    return [$found, $detail];
+                }
+            );
+
+            $carried = $resolved['follow_up'] ? $this->carriedPassages($conversation, $userMessage) : [];
+            $packet = EvidencePacket::fromMatches($matches, $carried, (int) config('services.answer.max_evidence'));
+            $trace['retrieved_passages'] = count($matches);
+            $trace['carried_passages'] = count($carried);
+
+            $count = count($packet->all());
+            $this->sendStep(
+                'results',
+                'completed',
+                $count > 0 ? "Found {$count} relevant passage(s)" : 'No relevant passages found',
+                $count > 0
+                    ? $this->formatSourceLines(array_map(fn ($i) => $i, array_values($packet->all())))
+                    : 'None of your uploaded documents matched this question closely enough.'
+            );
+
+            $userTexts = $conversation->messages()->where('role', 'user')->pluck('content')->all();
+
+            $result = $this->runStep(
+                'generate',
+                'Generating your answer',
+                'Asking Gemini ('.config('services.gemini.chat_model').') to answer in structured form using only the retrieved passages, then checking every claim against them.',
+                function () use ($message, $previous, $packet, $userTexts, $resolved) {
+                    $result = app(AnswerService::class)->answer(
+                        $message,
+                        $resolved['follow_up'] ? $previous?->content : null,
+                        $packet,
+                        $userTexts
+                    );
+
+                    $detail = match ($result['status']) {
+                        AnswerService::ANSWERED => count($result['claims']).' verified statement(s) with citations.',
+                        AnswerService::INSUFFICIENT => 'The documents do not contain a verifiable answer.',
+                        default => 'The model output could not be used.',
+                    };
+
+                    return [$result, $detail];
+                }
+            );
+        } catch (Throwable $e) {
+            report($e);
+
+            $text = str_contains($e->getMessage(), 'UNAVAILABLE') || str_contains($e->getMessage(), '503')
+                ? 'The model is temporarily overloaded. Please try asking again in a moment.'
+                : 'Something went wrong while answering. Please try again.';
+
+            $conversation->messages()->create([
+                'role' => 'assistant',
+                'content' => $text,
+                'sources' => [],
+                'meta' => ['status' => AnswerService::PROVIDER_ERROR, 'trace' => $trace],
+            ]);
+
+            $this->sendEvent('error', ['message' => $text]);
+
+            return;
+        }
+
+        $this->finishVerified($conversation, $result, $trace);
+    }
+
+    /**
+     * @param  array<string, mixed>  $result
+     * @param  array<string, mixed>  $trace
+     */
+    private function finishVerified(ChatConversation $conversation, array $result, array $trace): void
+    {
+        foreach (preg_split('/(?<=\n)/', $result['content'], -1, PREG_SPLIT_NO_EMPTY) as $piece) {
+            $this->sendEvent('token', ['token' => $piece]);
+        }
+
+        $meta = [
+            'status' => $result['status'],
+            'claims' => $result['claims'],
+            'conflicts' => $result['conflicts'],
+            'calculations' => $result['calculations'],
+            'warnings' => $result['warnings'],
+            'trace' => $trace,
+        ];
+
+        $assistant = $conversation->messages()->create([
+            'role' => 'assistant',
+            'content' => $result['content'],
+            'sources' => $result['sources'],
+            'meta' => $meta,
+        ]);
+
+        $this->sendEvent('done', ['sources' => $result['sources'], 'message_id' => $assistant->id] + $meta);
+    }
+
+    /**
+     * Passages the previous answer cited, reused so a short follow-up still sees the same document text.
+     * Only document text is carried over, never the earlier model answer.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function carriedPassages(ChatConversation $conversation, Message $userMessage): array
+    {
+        $previousAnswer = $conversation->messages()
+            ->where('role', 'assistant')
+            ->where('id', '<', $userMessage->id)
+            ->orderByDesc('id')
+            ->first();
+
+        // Only an answered reply cited anything; a refusal's sources are just the closest misses.
+        $ids = ($previousAnswer?->meta['status'] ?? null) === AnswerService::ANSWERED
+            ? collect($previousAnswer->sources ?? [])->pluck('chunk_id')->filter()->all()
+            : [];
+
+        if ($ids === []) {
+            return [];
+        }
+
+        return Chunk::with('document')
+            ->whereIn('pinecone_vector_id', $ids)
+            ->get()
+            ->map(fn (Chunk $chunk) => [
+                'id' => $chunk->pinecone_vector_id,
+                'score' => null,
+                'metadata' => [
+                    'document_name' => $chunk->document?->original_name,
+                    'page' => $chunk->page_number,
+                    'text' => $chunk->content,
+                ],
+            ])
+            ->all();
     }
 
     /**
